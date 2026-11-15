@@ -2,6 +2,7 @@
 import { NXTHEME_ASSET_FILENAMES, type NxthemeAssetKey } from "@themezernx/nxtheme-builder"
 import { useNxthemeBuilder } from "~/composables/useNxthemeBuilder"
 import { useNxthemeImport } from "~/composables/useNxthemeImport"
+import { useLayoutLibrary, type LibraryLayout } from "~/composables/useLayoutLibrary"
 import {
     ASSET_DISPLAY_NAMES,
     ASSET_ICON_PRESETS,
@@ -10,24 +11,103 @@ import {
     getAllowedAssetKeysByTarget,
     INFO_TARGETS,
     INFO_TARGET_LABELS,
+    type NxthemeInfoTarget,
     type SwitchThemeFormData,
+    type ThemeAssets,
 } from "~/types/switch-theme"
-
-const createInitialForm = (): SwitchThemeFormData => ({
-    id: createThemeId(),
-    name: "",
-    author: "",
-    target: "home",
-    layoutJson: "",
-    commonJson: "",
-    assets: {},
-})
 
 const clamp = (value: number, min: number, max: number): number => Math.min(Math.max(value, min), max)
 const ASPECT_EPSILON = 0.0001
 
-const form = ref<SwitchThemeFormData>(createInitialForm())
+// Shared fields (same for every screen), the active screen, and per-screen assets/previews.
+const sharedForm = reactive({
+    id: createThemeId(),
+    name: "",
+    author: "",
+    commonJson: "",
+})
+const currentTarget = ref<NxthemeInfoTarget>("home")
+const assetsByTarget = ref<Partial<Record<NxthemeInfoTarget, ThemeAssets>>>({})
+const layoutsByTarget = ref<Partial<Record<NxthemeInfoTarget, string>>>({})
+const previewUrlsByTarget = ref<Partial<Record<NxthemeInfoTarget, Partial<Record<NxthemeAssetKey, string>>>>>({})
+
+// Read-only view of the active screen's form, kept for existing code paths.
+const form = computed<SwitchThemeFormData>(() => ({
+    id: sharedForm.id,
+    name: sharedForm.name,
+    author: sharedForm.author,
+    target: currentTarget.value,
+    layoutJson: layoutsByTarget.value[currentTarget.value] ?? "",
+    commonJson: sharedForm.commonJson,
+    assets: { ...(assetsByTarget.value[currentTarget.value] ?? {}) },
+}))
+
+// Writable view of the active screen's layout JSON (for v-model).
+const activeLayoutJson = computed<string>({
+    get: () => layoutsByTarget.value[currentTarget.value] ?? "",
+    set: (value: string) => {
+        layoutsByTarget.value = { ...layoutsByTarget.value, [currentTarget.value]: value }
+    },
+})
+
+const currentAssets = computed<ThemeAssets>(() => assetsByTarget.value[currentTarget.value] ?? {})
+const currentPreviews = computed<Partial<Record<NxthemeAssetKey, string>>>(
+    () => previewUrlsByTarget.value[currentTarget.value] ?? {},
+)
+
+const exportAllParts = ref(false)
 const loading = ref(false)
+
+// Layout library (ThemezerNX/Layouts) integration.
+const {
+    layouts: libraryLayouts,
+    loading: libraryLoading,
+    error: libraryError,
+    load: loadLibrary,
+    layoutsForTarget,
+    fetchLayoutJson,
+} = useLayoutLibrary()
+const libraryOpen = ref(false)
+const layoutSearch = ref("")
+const selectedLayoutPathByTarget = ref<Partial<Record<NxthemeInfoTarget, string>>>({})
+
+const filteredLibraryLayouts = computed(() => {
+    const term = layoutSearch.value.trim().toLowerCase()
+    return layoutsForTarget(currentTarget.value).filter(
+        (item) => !term || item.name.toLowerCase().includes(term),
+    )
+})
+
+const selectedLibraryLayoutName = computed(() => {
+    const path = selectedLayoutPathByTarget.value[currentTarget.value]
+    if (!path) return ""
+    const found = libraryLayouts.value.find((item) => item.layoutPath === path)
+    return found ? found.name : "Custom JSON"
+})
+
+const toggleLibrary = () => {
+    libraryOpen.value = !libraryOpen.value
+    if (libraryOpen.value) void loadLibrary()
+}
+
+const onPickLibraryLayout = async (item: LibraryLayout) => {
+    try {
+        const json = await fetchLayoutJson(item.layoutPath)
+        activeLayoutJson.value = json
+        selectedLayoutPathByTarget.value = {
+            ...selectedLayoutPathByTarget.value,
+            [currentTarget.value]: item.layoutPath,
+        }
+        error.value = ""
+        toast({
+            toast: "solid-success",
+            title: "Success",
+            description: `Loaded ${item.name} for this screen.`,
+        })
+    } catch {
+        error.value = "Failed to fetch the layout JSON."
+    }
+}
 const error = ref("")
 const warning = ref("")
 const { toast } = useToast()
@@ -38,7 +118,6 @@ const nameInputRef = ref<HTMLInputElement | null>(null)
 const authorInputRef = ref<HTMLInputElement | null>(null)
 const nameInputTouched = ref(false)
 const authorInputTouched = ref(false)
-const previewUrls = ref<Partial<Record<NxthemeAssetKey, string>>>({})
 const assetInputRefs = ref<Partial<Record<NxthemeAssetKey, HTMLInputElement | null>>>({})
 const dragActive = ref<Partial<Record<NxthemeAssetKey, boolean>>>({})
 
@@ -63,11 +142,11 @@ const cropDrag = reactive({
     startCropY: 0,
 })
 
-const { buildAndDownload } = useNxthemeBuilder()
+const { buildAndDownload, buildAndDownloadMultiple } = useNxthemeBuilder()
 const { importNxtheme } = useNxthemeImport()
 const runtimeConfig = useRuntimeConfig()
 
-const allowedAssetKeys = computed(() => getAllowedAssetKeysByTarget(form.value.target))
+const allowedAssetKeys = computed(() => getAllowedAssetKeysByTarget(currentTarget.value))
 const backgroundAssetKey = computed<NxthemeAssetKey | null>(() => (
     allowedAssetKeys.value.includes("backgroundImage") ? "backgroundImage" : null
 ))
@@ -86,16 +165,39 @@ const themezerIconUrl = computed(() => {
 })
 
 const clearPreview = (assetKey: NxthemeAssetKey) => {
-    const url = previewUrls.value[assetKey]
+    const previews = previewUrlsByTarget.value[currentTarget.value]
+    const url = previews?.[assetKey]
     if (url) {
         URL.revokeObjectURL(url)
+        const next = { ...previews }
+        delete next[assetKey]
+        previewUrlsByTarget.value = { ...previewUrlsByTarget.value, [currentTarget.value]: next }
     }
-    delete previewUrls.value[assetKey]
 }
 
 const setPreviewFromFile = (assetKey: NxthemeAssetKey, file: File) => {
     clearPreview(assetKey)
-    previewUrls.value[assetKey] = URL.createObjectURL(file)
+    const next = { ...(previewUrlsByTarget.value[currentTarget.value] ?? {}) }
+    next[assetKey] = URL.createObjectURL(file)
+    previewUrlsByTarget.value = { ...previewUrlsByTarget.value, [currentTarget.value]: next }
+}
+
+const clearAllPreviews = () => {
+    for (const target of Object.keys(previewUrlsByTarget.value) as NxthemeInfoTarget[]) {
+        const previews = previewUrlsByTarget.value[target]
+        if (!previews) continue
+        for (const key of Object.keys(previews) as NxthemeAssetKey[]) {
+            const url = previews[key]
+            if (url) URL.revokeObjectURL(url)
+        }
+    }
+    previewUrlsByTarget.value = {}
+}
+
+const setAsset = (assetKey: NxthemeAssetKey, file: File | null) => {
+    const nextAssets: ThemeAssets = { ...(assetsByTarget.value[currentTarget.value] ?? {}) }
+    nextAssets[assetKey] = file
+    assetsByTarget.value = { ...assetsByTarget.value, [currentTarget.value]: nextAssets }
 }
 
 const closeCropEditor = () => {
@@ -271,26 +373,14 @@ const drawCropPreview = () => {
 
 watch(() => [cropState.zoom, cropState.x, cropState.y, cropAssetKey.value], drawCropPreview)
 
-watch(
-    () => form.value.target,
-    (target) => {
-        const allowed = new Set(getAllowedAssetKeysByTarget(target))
-        for (const key of Object.keys(form.value.assets) as NxthemeAssetKey[]) {
-            if (!allowed.has(key)) {
-                form.value.assets[key] = null
-                clearPreview(key)
-            }
-        }
-        if (target !== "home") {
-            form.value.commonJson = ""
-        }
-    },
-)
+watch(currentTarget, (target) => {
+    if (target !== "home") {
+        sharedForm.commonJson = ""
+    }
+})
 
 onBeforeUnmount(() => {
-    for (const key of Object.keys(previewUrls.value) as NxthemeAssetKey[]) {
-        clearPreview(key)
-    }
+    clearAllPreviews()
     closeCropEditor()
 })
 
@@ -342,7 +432,7 @@ const applyCrop = async () => {
     )
 
     const nextFile = await canvasToAssetFile(canvas, assetKey)
-    form.value.assets[assetKey] = nextFile
+    setAsset(assetKey, nextFile)
     setPreviewFromFile(assetKey, nextFile)
     closeCropEditor()
     toast({
@@ -353,7 +443,7 @@ const applyCrop = async () => {
 }
 
 const removeAsset = (assetKey: NxthemeAssetKey) => {
-    form.value.assets[assetKey] = null
+    setAsset(assetKey, null)
     clearPreview(assetKey)
 }
 
@@ -377,7 +467,7 @@ const handleAssetFile = async (assetKey: NxthemeAssetKey, file: File) => {
 
         if (aspectMatches) {
             const nextFile = await autoResizeAsset(assetKey, image)
-            form.value.assets[assetKey] = nextFile
+            setAsset(assetKey, nextFile)
             setPreviewFromFile(assetKey, nextFile)
 
             if (image.width > rule.width || image.height > rule.height) {
@@ -449,7 +539,7 @@ const onLayoutJsonSelected = async (event: Event) => {
     if (!file) return
 
     try {
-        form.value.layoutJson = await readTextFile(file)
+        activeLayoutJson.value = await readTextFile(file)
         error.value = ""
         toast({
             toast: "solid-success",
@@ -469,7 +559,7 @@ const onCommonJsonSelected = async (event: Event) => {
     if (!file) return
 
     try {
-        form.value.commonJson = await readTextFile(file)
+        sharedForm.commonJson = await readTextFile(file)
         error.value = ""
         toast({
             toast: "solid-success",
@@ -484,11 +574,11 @@ const onCommonJsonSelected = async (event: Event) => {
 }
 
 const clearLayoutJson = () => {
-    form.value.layoutJson = ""
+    activeLayoutJson.value = ""
 }
 
 const clearCommonJson = () => {
-    form.value.commonJson = ""
+    sharedForm.commonJson = ""
 }
 
 const onImportSelected = async (event: Event) => {
@@ -501,7 +591,14 @@ const onImportSelected = async (event: Event) => {
 
     try {
         const result = await importNxtheme(file, form.value)
-        form.value = result.nextForm
+        clearAllPreviews()
+        sharedForm.id = result.nextForm.id
+        sharedForm.name = result.nextForm.name
+        sharedForm.author = result.nextForm.author
+        layoutsByTarget.value = { [result.nextForm.target]: result.nextForm.layoutJson }
+        sharedForm.commonJson = result.nextForm.commonJson
+        currentTarget.value = result.nextForm.target
+        assetsByTarget.value = { [result.nextForm.target]: { ...result.nextForm.assets } }
         for (const key of Object.keys(result.nextForm.assets) as NxthemeAssetKey[]) {
             const asset = result.nextForm.assets[key]
             if (asset) setPreviewFromFile(key, asset)
@@ -520,10 +617,14 @@ const onImportSelected = async (event: Event) => {
 }
 
 const onReset = () => {
-    for (const key of Object.keys(previewUrls.value) as NxthemeAssetKey[]) {
-        clearPreview(key)
-    }
-    form.value = createInitialForm()
+    clearAllPreviews()
+    sharedForm.id = createThemeId()
+    sharedForm.name = ""
+    sharedForm.author = ""
+    layoutsByTarget.value = {}
+    sharedForm.commonJson = ""
+    assetsByTarget.value = {}
+    currentTarget.value = "home"
     closeCropEditor()
     warning.value = ""
     error.value = ""
@@ -564,12 +665,32 @@ const onBuild = async () => {
 
     loading.value = true
     try {
-        const fileName = await buildAndDownload(form.value)
-        toast({
-            toast: "solid-success",
-            title: "Success",
-            description: `Downloaded ${fileName}`,
-        })
+        if (exportAllParts.value) {
+            const forms = (INFO_TARGETS as readonly NxthemeInfoTarget[]).map((target) => ({
+                ...form.value,
+                target,
+                id: createThemeId(),
+                layoutJson: layoutsByTarget.value[target] ?? "",
+                commonJson: target === "home" ? sharedForm.commonJson : "",
+                assets: { ...(assetsByTarget.value[target] ?? {}) },
+            }))
+            const { results, skipped } = await buildAndDownloadMultiple(forms)
+            const summary = results.map((result) => result.filename).join(", ")
+            toast({
+                toast: "solid-success",
+                title: "Success",
+                description: skipped.length
+                    ? `Downloaded ${results.length} themes (${summary}). Skipped (no image/layout): ${skipped.join(", ")}`
+                    : `Downloaded ${results.length} themes: ${summary}`,
+            })
+        } else {
+            const fileName = await buildAndDownload(form.value)
+            toast({
+                toast: "solid-success",
+                title: "Success",
+                description: `Downloaded ${fileName}`,
+            })
+        }
     } catch (nextError) {
         error.value = nextError instanceof Error ? nextError.message : "Failed to build NXTheme."
     } finally {
@@ -647,12 +768,12 @@ const onBuild = async () => {
         </span>
                     <n-input
                         ref="nameInputRef"
-                        v-model="form.name"
+                        v-model="sharedForm.name"
                         placeholder="My Theme"
                         required
                         @blur="nameInputTouched = true"
                     />
-                    <p v-if="nameInputTouched && !form.name.trim()" class="text-xs text-red-400 mt-1">Theme name is required</p>
+                    <p v-if="nameInputTouched && !sharedForm.name.trim()" class="text-xs text-red-400 mt-1">Theme name is required</p>
                 </label>
                 <label class="grid gap-1 text-sm">
         <span class="flex items-center justify-between gap-2">
@@ -661,18 +782,18 @@ const onBuild = async () => {
         </span>
                     <n-input
                         ref="authorInputRef"
-                        v-model="form.author"
+                        v-model="sharedForm.author"
                         placeholder="Your name"
                         required
                         @blur="authorInputTouched = true"
                     />
-                    <p v-if="authorInputTouched && !form.author.trim()" class="text-xs text-red-400 mt-1">Author is required</p>
+                    <p v-if="authorInputTouched && !sharedForm.author.trim()" class="text-xs text-red-400 mt-1">Author is required</p>
                 </label>
             </section>
 
             <section class="mb-4 grid gap-3 rounded-2xl border border-slate-800 bg-slate-900/90 p-4 shadow-xl">
                 <h2 class="text-lg font-semibold">Target</h2>
-                <n-tabs v-model="form.target">
+                <n-tabs v-model="currentTarget">
                     <n-tabs-list
                         class="!grid !h-auto !w-full !gap-1 !rounded-xl !border !border-slate-850 !bg-slate-950/60 !p-1 sm:!grid-cols-2 lg:!grid-cols-4 xl:!grid-cols-7">
                         <n-tabs-trigger
@@ -706,8 +827,8 @@ const onBuild = async () => {
                             @drop.prevent="onAssetDrop(backgroundAssetKey, $event)"
                         >
                             <img
-                                v-if="previewUrls[backgroundAssetKey]"
-                                :src="previewUrls[backgroundAssetKey]"
+                                v-if="currentPreviews[backgroundAssetKey]"
+                                :src="currentPreviews[backgroundAssetKey]"
                                 :alt="ASSET_DISPLAY_NAMES[backgroundAssetKey]"
                                 class="h-full w-full object-contain transition-transform duration-300 group-hover:scale-[1.02]"
                             />
@@ -732,7 +853,7 @@ const onBuild = async () => {
                                 accept="image/*"
                                 @change="onAssetSelected(backgroundAssetKey, $event)"
                             />
-                            <n-button btn="soft-error" size="sm" :disabled="!form.assets[backgroundAssetKey]"
+                            <n-button btn="soft-error" size="sm" :disabled="!currentAssets[backgroundAssetKey]"
                                       leading="i-lucide-x-circle" @click="removeAsset(backgroundAssetKey)">Clear
                             </n-button>
                         </div>
@@ -746,17 +867,54 @@ const onBuild = async () => {
                 <article
                     class="flex flex-col h-full gap-3 rounded-2xl border border-slate-800 bg-slate-900/90 p-4 shadow-xl max-lg:order-3">
                     <h2 class="text-lg font-semibold">Layouts</h2>
+                    <!-- Layout library picker (ThemezerNX/Layouts) -->
+                    <div class="rounded-xl border border-slate-800 bg-slate-950/40 p-3 flex flex-col gap-2">
+                        <div class="flex flex-wrap items-center gap-2">
+                            <n-button size="sm" btn="soft"
+                                      :leading="libraryOpen ? 'i-lucide-chevron-up' : 'i-lucide-layout-grid'"
+                                      @click="toggleLibrary">
+                                {{ libraryOpen ? "Hide layout library" : "Browse layout library" }}
+                            </n-button>
+                            <span v-if="selectedLibraryLayoutName"
+                                  class="text-xs text-emerald-400 truncate">
+                                Active: {{ selectedLibraryLayoutName }}
+                            </span>
+                        </div>
+                        <p v-if="libraryError" class="text-xs text-red-400">{{ libraryError }}</p>
+                        <template v-if="libraryOpen">
+                            <input v-model="layoutSearch" type="text"
+                                   class="w-full rounded-lg border border-slate-800 bg-slate-950/60 px-3 py-2 text-xs text-slate-200 placeholder-slate-600 outline-none focus:border-primary-500/50"
+                                   placeholder="Search layouts for this screen..." />
+                            <p v-if="libraryLoading" class="text-xs text-slate-500">Loading layout library...</p>
+                            <div v-else
+                                 class="grid max-h-64 grid-cols-2 gap-2 overflow-y-auto sm:grid-cols-3">
+                                <button v-for="item in filteredLibraryLayouts" :key="item.layoutPath" type="button"
+                                        class="group rounded-lg border border-slate-800 bg-slate-900/80 p-2 text-left transition-colors hover:border-emerald-500/60"
+                                        @click="onPickLibraryLayout(item)">
+                                    <img :src="item.overlayUrl" :alt="item.name" loading="lazy"
+                                         class="mb-1 h-16 w-full rounded object-cover" />
+                                    <span class="text-xs font-medium text-slate-200 group-hover:text-emerald-400">
+                                        {{ item.name }}
+                                    </span>
+                                </button>
+                                <p v-if="filteredLibraryLayouts.length === 0"
+                                   class="col-span-full text-xs text-slate-500">
+                                    No layouts found for this screen.
+                                </p>
+                            </div>
+                        </template>
+                    </div>
                     <div class="flex flex-col gap-3 flex-grow min-h-0">
                         <label class="flex flex-col gap-1 text-sm flex-1 min-h-0">
                             <span class="text-xs text-slate-400">layout.json</span>
                             <div class="relative flex-grow min-h-40">
                                 <textarea
-                                    v-model="form.layoutJson"
+                                    v-model="activeLayoutJson"
                                     class="h-full w-full rounded-xl border border-slate-800 bg-slate-950/40 p-3 text-xs font-mono text-slate-300 placeholder-slate-600 focus:border-primary-500/50 focus:ring-1 focus:ring-primary-500/50 transition-all duration-200 outline-none resize-none"
                                     placeholder="Paste layout JSON here. If set, background image is optional."
                                 />
                                 <button
-                                    v-if="form.layoutJson.trim()"
+                                    v-if="activeLayoutJson.trim()"
                                     type="button"
                                     class="absolute right-2.5 top-2.5 rounded-lg bg-red-950/40 p-1 text-red-400 hover:bg-red-950/80 transition-colors border border-red-900/30"
                                     @click="clearLayoutJson"
@@ -778,19 +936,19 @@ const onBuild = async () => {
                             />
                         </label>
 
-                        <label v-if="form.target === 'home'" class="flex flex-col gap-1 text-sm flex-1 min-h-0">
+                        <label v-if="currentTarget === 'home'" class="flex flex-col gap-1 text-sm flex-1 min-h-0">
                             <span class="flex items-center justify-between gap-2 text-xs text-slate-400">
                                 <span>common.json</span>
                                 <n-badge badge="outline" size="xs" class="uppercase">optional</n-badge>
                             </span>
                             <div class="relative flex-grow min-h-40">
                                 <textarea
-                                    v-model="form.commonJson"
+                                    v-model="sharedForm.commonJson"
                                     class="h-full w-full rounded-xl border border-slate-800 bg-slate-950/40 p-3 text-xs font-mono text-slate-300 placeholder-slate-600 focus:border-primary-500/50 focus:ring-1 focus:ring-primary-500/50 transition-all duration-200 outline-none resize-none"
                                     placeholder="Paste common JSON here."
                                 />
                                 <button
-                                    v-if="form.commonJson.trim()"
+                                    v-if="sharedForm.commonJson.trim()"
                                     type="button"
                                     class="absolute right-2.5 top-2.5 rounded-lg bg-red-950/40 p-1 text-red-400 hover:bg-red-950/80 transition-colors border border-red-900/30"
                                     @click="clearCommonJson"
@@ -843,8 +1001,8 @@ const onBuild = async () => {
                             @drop.prevent="onAssetDrop(key, $event)"
                         >
                             <img
-                                v-if="previewUrls[key]"
-                                :src="previewUrls[key]"
+                                v-if="currentPreviews[key]"
+                                :src="currentPreviews[key]"
                                 :alt="ASSET_DISPLAY_NAMES[key]"
                                 class="h-auto max-h-[64px] w-auto max-w-[64px] object-contain transition-transform duration-300 group-hover/drop:scale-105"
                             />
@@ -876,7 +1034,7 @@ const onBuild = async () => {
                                 accept="image/*"
                                 @change="onAssetSelected(key, $event)"
                             />
-                            <n-button icon size="xs" btn="soft-error" :disabled="!form.assets[key]"
+                            <n-button icon size="xs" btn="soft-error" :disabled="!currentAssets[key]"
                                       leading="i-lucide-x" class="px-2" @click="removeAsset(key)">
                             </n-button>
                         </div>
@@ -951,7 +1109,12 @@ const onBuild = async () => {
             </n-dialog>
 
             <section class="grid gap-2 rounded-2xl border border-slate-800 bg-slate-900/90 p-4 shadow-xl">
-                <div class="flex flex-wrap justify-center gap-2">
+                <div class="flex flex-wrap justify-center items-center gap-2">
+                    <label
+                        class="flex cursor-pointer items-center gap-2 rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-2 text-sm text-slate-200 select-none">
+                        <input v-model="exportAllParts" type="checkbox" class="h-4 w-4 accent-emerald-500" />
+                        <span>Build every screen (each keeps its own background)</span>
+                    </label>
                     <n-button :disabled="loading" :leading="loading ? 'i-lucide-loader-circle' : 'i-lucide-download'"
                                @click="onBuild">
                         {{ loading ? "Building..." : "Build and Download .nxtheme" }}
